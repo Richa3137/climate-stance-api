@@ -1,0 +1,5 @@
+Rank,Model Name,Pretrained Checkpoint,Training Configuration,Accuracy,Macro F1,Weighted F1,F1 (AGAINST),F1 (NONE),F1 (FAVOR),Training Time (s)
+1,XLM-RoBERTa,xlm-roberta-base,"lr=3e-05, bs=16, max_len=128, epochs=8 (ES=2), Weighted CE",0.6963,0.6767,0.6964,0.7678,0.6111,0.6513,229.59
+2,AI4Bharat IndicBERT,ai4bharat/IndicBERTv2-MLM-only,"lr=3e-05, bs=16, max_len=128, epochs=8 (ES=2), Weighted CE",0.6856,0.6735,0.6859,0.7304,0.6708,0.6192,197.02
+3,Multilingual BERT (mBERT),bert-base-multilingual-cased,"lr=3e-05, bs=16, max_len=128, epochs=8 (ES=2), Weighted CE",0.6874,0.6725,0.6898,0.7519,0.6536,0.6118,177.65
+4,Google MuRIL,google/muril-base-cased,"lr=3e-05, bs=16, max_len=128, epochs=8 (ES=2), Weighted CE",0.4902,0.3539,0.418,0.6531,0.0133,0.3953,108.27

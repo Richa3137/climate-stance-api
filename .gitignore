@@ -1,0 +1,7 @@
+# Exclude local 3.9GB saved_models checkpoints (Render downloads richa3137/climate-stance-xlmr from Hugging Face)
+**/saved_models/
+**/model.safetensors
+**/training_args.bin
+__pycache__/
+*.pyc
+.env

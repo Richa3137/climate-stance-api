@@ -1,0 +1,9 @@
+[logger]
+hideWelcomeMessage = true
+
+[client]
+toolbarMode = "minimal"
+
+[server]
+headless = false
+runOnSave = false
