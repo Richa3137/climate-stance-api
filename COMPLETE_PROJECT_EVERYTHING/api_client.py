@@ -24,7 +24,7 @@ import numpy as np
 import pandas as pd
 import requests
 
-DEFAULT_API_URL = os.environ.get("RENDER_API_URL", "http://127.0.0.1:8000")
+DEFAULT_API_URL = os.environ.get("RENDER_API_URL", "https://climate-stance-api-1.onrender.com")
 ID_NAMES = ["ID", "INDEX", "ROW", "ROW_ID", "S.NO", "SNO", "SR.NO"]
 TEXT_NAMES = ["text", "clean_comment", "hindi_comment", "raw_comment", "comment", "tweet", "sentence", "content", "post"]
 
