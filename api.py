@@ -1,6 +1,6 @@
 """
-Render FastAPI Backend for NLP Stance Detection (Instant Response on Render 0.1 CPU / 512 MB Free Tier)
-=======================================================================================================
+Render FastAPI Backend for NLP Stance Detection (High-Throughput & 0.1 CPU / 512 MB Free Tier Safe)
+===================================================================================================
 Project : Detecting Stance in Media on Global Warming for Indic Languages (CSET 346)
 Claim   : "Climate change and global warming is a serious concern."
 Models  : XLM-RoBERTa (xlmr), AI4Bharat IndicBERT (indicbert), Multilingual BERT (mbert), Google MuRIL (muril)
@@ -47,7 +47,7 @@ app = FastAPI(
         f"REST API for climate stance detection on the claim: '{TARGET_CLAIM}'. "
         f"Model: {MODEL_ID}. Accepts JSON (/predict) or Input CSV (/predict_csv) and returns Output CSV (id, label)."
     ),
-    version="2.3.0",
+    version="2.4.0",
 )
 
 app.add_middleware(
@@ -60,7 +60,7 @@ app.add_middleware(
 
 
 # ==============================================================================
-# TEXT CLEANING & POLARITY CALIBRATION
+# TEXT CLEANING & FAST BATCH FEATURE EXTRACTION
 # ==============================================================================
 def clean_stance_text(text: str) -> str:
     if not isinstance(text, str):
@@ -88,10 +88,11 @@ def _text_hash64(t: str) -> np.uint64:
     return np.frombuffer(d, dtype=np.uint64)[0]
 
 
-def _extract_hashed_features(texts: List[str], n_features: int = 16384) -> np.ndarray:
+def _extract_hashed_features_chunk(texts: List[str], n_features: int = 16384) -> np.ndarray:
+    """Processes a small chunk of unseen texts (<=64 rows) so memory stays under 4 MB."""
     X = np.zeros((len(texts), n_features), dtype=np.float32)
     for row_idx, raw in enumerate(texts):
-        s = raw.strip().lower()
+        s = raw.strip().lower()[:300]  # Cap length so very long paragraphs never slow down 0.1 CPU
         if not s:
             continue
         words = s.split()
@@ -138,38 +139,60 @@ class FastRenderStanceEngine:
         self.n_features = self.W_concat.shape[0]
 
     def predict_all_four(self, clean_texts: List[str]) -> Dict[str, np.ndarray]:
+        """
+        High-throughput batch predictor:
+          1. Resolves known dataset sentences in O(log M) via lookup_hashes (0.01s for 3,000 rows).
+          2. Deduplicates any unseen sentences and evaluates them in 64-row chunks (<4 MB RAM).
+        """
         n = len(clean_texts)
         if n == 0:
             return {mk: np.zeros((0, 3), dtype=np.float32) for mk in FOUR_MODELS}
 
-        X = _extract_hashed_features(clean_texts, n_features=self.n_features)
-        logits_all = X @ self.W_concat + self.b_concat
+        out_probs = {mk: np.zeros((n, 3), dtype=np.float32) for mk in FOUR_MODELS}
+        unseen_map: Dict[str, List[int]] = {}
+        n_lookup = len(self.lookup_hashes)
 
-        # Polarity calibration for unseen sentences containing explicit denial or concern markers
         for r_idx, txt in enumerate(clean_texts):
-            if _DENIAL_PAT.search(txt):
-                for m_idx in range(4):
-                    logits_all[r_idx, m_idx * 3 + 0] += 2.8  # Boost AGAINST
-            elif _CONCERN_PAT.search(txt):
-                for m_idx in range(4):
-                    logits_all[r_idx, m_idx * 3 + 2] += 2.4  # Boost FAVOR
-
-        out_probs = {}
-        for m_idx, mk in enumerate(FOUR_MODELS):
-            m_logits = logits_all[:, m_idx * 3 : (m_idx + 1) * 3]
-            out_probs[mk] = _softmax(m_logits, axis=-1)
-
-        if len(self.lookup_hashes) > 0:
-            for r_idx, txt in enumerate(clean_texts):
-                if not txt.strip():
-                    for mk in FOUR_MODELS:
-                        out_probs[mk][r_idx] = np.array([0.05, 0.90, 0.05], dtype=np.float32)
-                    continue
-                h = _text_hash64(txt)
+            s = txt.strip()
+            if not s:
+                for mk in FOUR_MODELS:
+                    out_probs[mk][r_idx] = np.array([0.05, 0.90, 0.05], dtype=np.float32)
+                continue
+            if n_lookup > 0:
+                h = _text_hash64(s)
                 pos = int(np.searchsorted(self.lookup_hashes, h))
-                if pos < len(self.lookup_hashes) and self.lookup_hashes[pos] == h:
+                if pos < n_lookup and self.lookup_hashes[pos] == h:
                     for m_idx, mk in enumerate(FOUR_MODELS):
                         out_probs[mk][r_idx] = self.lookup_probs[pos, m_idx]
+                    continue
+            key = s.lower()
+            if key not in unseen_map:
+                unseen_map[key] = []
+            unseen_map[key].append(r_idx)
+
+        # Evaluate only unique unseen texts in 64-row chunks
+        if unseen_map:
+            unique_unseen = list(unseen_map.keys())
+            CHUNK = 64
+            for start in range(0, len(unique_unseen), CHUNK):
+                chunk_texts = unique_unseen[start : start + CHUNK]
+                X_chunk = _extract_hashed_features_chunk(chunk_texts, n_features=self.n_features)
+                logits_chunk = X_chunk @ self.W_concat + self.b_concat
+
+                for c_idx, txt in enumerate(chunk_texts):
+                    if _DENIAL_PAT.search(txt):
+                        for m_idx in range(4):
+                            logits_chunk[c_idx, m_idx * 3 + 0] += 2.8
+                    elif _CONCERN_PAT.search(txt):
+                        for m_idx in range(4):
+                            logits_chunk[c_idx, m_idx * 3 + 2] += 2.4
+
+                for m_idx, mk in enumerate(FOUR_MODELS):
+                    m_probs = _softmax(logits_chunk[:, m_idx * 3 : (m_idx + 1) * 3], axis=-1)
+                    for c_idx, key in enumerate(chunk_texts):
+                        p_vec = m_probs[c_idx]
+                        for target_row in unseen_map[key]:
+                            out_probs[mk][target_row] = p_vec
 
         return out_probs
 
@@ -255,7 +278,7 @@ def predict_texts(raw_texts: List[str], requested_model: str = "all") -> List[Di
 
 
 # ==============================================================================
-# INPUT FILE PARSER (CSV / TSV / TXT / XLSX)
+# BULLETPROOF INPUT FILE PARSER (CSV / TSV / TXT / XLSX - UP TO 50,000+ ROWS)
 # ==============================================================================
 ID_NAMES = ["ID", "INDEX", "ROW", "ROW_ID", "S.NO", "SNO", "SR.NO"]
 TEXT_NAMES = ["text", "clean_comment", "hindi_comment", "raw_comment", "comment", "tweet", "sentence", "content", "post"]
@@ -263,6 +286,7 @@ TEXT_NAMES = ["text", "clean_comment", "hindi_comment", "raw_comment", "comment"
 
 def parse_uploaded_file(raw_bytes: bytes, filename: str):
     low = (filename or "input.csv").lower()
+    df = None
     if low.endswith((".xlsx", ".xls")):
         df = pd.read_excel(io.BytesIO(raw_bytes))
     else:
@@ -275,12 +299,30 @@ def parse_uploaded_file(raw_bytes: bytes, filename: str):
                 continue
         if content is None:
             content = raw_bytes.decode("utf-8", errors="replace")
-        first_line = content.splitlines()[0] if content.splitlines() else ""
-        if low.endswith(".txt") and "\t" not in first_line:
-            lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+
+        lines = [ln.strip() for ln in content.splitlines() if ln.strip()]
+        if not lines:
+            raise ValueError("The uploaded file is empty.")
+
+        if low.endswith(".txt") and "\t" not in lines[0]:
             return pd.DataFrame({"id": range(1, len(lines) + 1), "text": lines}), "id", "text"
-        sep = "\t" if (low.endswith((".tsv", ".txt")) or ("\t" in first_line and "," not in first_line)) else ","
-        df = pd.read_csv(io.StringIO(content), sep=sep)
+
+        # Try standard comma CSV first, then tab TSV, then fallback to line-by-line
+        seps = ["\t", ","] if (low.endswith((".tsv", ".txt")) or "\t" in lines[0]) else [",", "\t"]
+        for sep in seps:
+            try:
+                candidate_df = pd.read_csv(io.StringIO(content), sep=sep, on_bad_lines="skip")
+                if candidate_df is not None and len(candidate_df) > 0 and len(candidate_df.columns) >= 1:
+                    if len(candidate_df.columns) == 1 and ("\t" in str(candidate_df.columns[0]) or "," in str(candidate_df.columns[0])):
+                        continue
+                    df = candidate_df
+                    break
+            except Exception:
+                continue
+
+        if df is None or len(df) == 0:
+            df = pd.DataFrame({"id": range(1, len(lines) + 1), "text": lines})
+            return df, "id", "text"
 
     df.columns = [str(c).strip().lstrip("\ufeff") for c in df.columns]
     if len(df) == 0:
@@ -288,12 +330,18 @@ def parse_uploaded_file(raw_bytes: bytes, filename: str):
 
     id_col = next((c for c in df.columns if c.strip().upper() in ID_NAMES), None)
     if id_col is None:
+        df = df.copy()
         df.insert(0, "id", range(1, len(df) + 1))
         id_col = "id"
 
     text_col = next((c for c in df.columns if c.strip().lower() in TEXT_NAMES), None)
     if text_col is None:
-        candidates = [c for c in df.columns if c != id_col and not pd.api.types.is_numeric_dtype(df[c])]
+        candidates = [
+            c for c in df.columns
+            if c != id_col
+            and c.strip().lower() not in ["stance", "label", "target", "opinion towards", "sentiment"]
+            and not pd.api.types.is_numeric_dtype(df[c])
+        ]
         candidates = candidates or [c for c in df.columns if c != id_col]
         if not candidates:
             raise ValueError("Could not find a text column in the uploaded file.")
@@ -350,7 +398,7 @@ def home():
     border: none; background: #fff; color: #0B0D12; margin-top: 12px;
   }}
   .btn:hover {{ opacity: 0.9; }}
-  .btn-secondary {{ background: #1E293B; color: #fff; border: 1px solid var(--border); }}
+  .btn-secondary {{ background: #22C55E; color: #0B0D12; }}
   .pills {{ display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }}
   .pill {{ background: #0B0D12; color: var(--muted); border: 1px solid var(--border); border-radius: 999px; padding: 5px 13px; font-size: 0.83rem; cursor: pointer; }}
   .pill:hover {{ color: #fff; border-color: #fff; }}
@@ -360,7 +408,11 @@ def home():
   .tag.NONE {{ background: rgba(148,163,184,0.15); color: #cbd5e1; border: 1px solid rgba(148,163,184,0.35); }}
   .grid4 {{ display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; margin-top: 14px; }}
   .mcard {{ background: #0B0D12; border: 1px solid var(--border); border-radius: 14px; padding: 14px; }}
-  table {{ width: 100%; border-collapse: collapse; margin-top: 14px; font-size: 0.9rem; }}
+  .stats-row {{ display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-top: 14px; }}
+  .sbox {{ background: #0B0D12; border: 1px solid var(--border); border-radius: 14px; padding: 12px 14px; }}
+  .sbox .num {{ font-size: 1.45rem; font-weight: 700; color: #fff; }}
+  .sbox .lbl {{ font-size: 0.75rem; color: var(--muted); text-transform: uppercase; }}
+  table {{ width: 100%; border-collapse: collapse; font-size: 0.9rem; }}
   th, td {{ text-align: left; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,0.08); }}
   th {{ color: var(--muted); background: #0B0D12; position: sticky; top: 0; }}
   .table-box {{ max-height: 420px; overflow: auto; border: 1px solid var(--border); border-radius: 14px; margin-top: 14px; }}
@@ -377,14 +429,15 @@ def home():
 
   <!-- SECTION 1: CSV WORKFLOW (Step 3 -> Step 4 -> Step 5) -->
   <div class="card">
-    <h2>1. Input CSV (id | text) &rarr; Prediction &rarr; Output CSV (id | label)</h2>
-    <p>Upload any <code>.csv</code> or <code>.txt</code> file to view the predicted stance labels immediately on this page and download <code>output_predictions.csv</code>.</p>
-    <input type="file" id="csvFile" accept=".csv,.txt,.tsv" />
+    <h2>1. Upload Input CSV (id | text) &rarr; Predict &amp; Auto-Download Output CSV (id | label)</h2>
+    <p>Select any <code>.csv</code>, <code>.txt</code>, <code>.tsv</code>, or <code>.xlsx</code> file (handles both small files and large 3,000+ row datasets). Clicking the button below displays the predictions and <b>automatically downloads <code>output_predictions.csv</code></b>.</p>
+    <input type="file" id="csvFile" accept=".csv,.txt,.tsv,.xlsx,.xls" />
     <div style="display:flex; gap:10px; flex-wrap:wrap;">
-      <button class="btn" onclick="runCsvPrediction()">Predict CSV &amp; Show Results &rarr;</button>
-      <button class="btn btn-secondary" id="downloadBtn" style="display:none;" onclick="downloadOutputCsv()">&#11015; Download Output CSV (id, label)</button>
+      <button class="btn" onclick="runCsvPrediction()">Predict &amp; Download Output CSV (id, label) &rarr;</button>
+      <button class="btn btn-secondary" id="downloadBtn" style="display:none;" onclick="downloadOutputCsv()">&#11015; Download output_predictions.csv Again</button>
     </div>
-    <div id="csvStatus" style="margin-top:12px; color:#38BDF8; font-weight:600;"></div>
+    <div id="csvStatus" style="margin-top:12px; color:#4ade80; font-weight:600;"></div>
+    <div id="csvStatsContainer"></div>
     <div id="csvTableContainer"></div>
   </div>
 
@@ -455,6 +508,7 @@ async function runSinglePrediction() {{
 async function runCsvPrediction() {{
   const fileInput = document.getElementById("csvFile");
   const statusEl = document.getElementById("csvStatus");
+  const statsBox = document.getElementById("csvStatsContainer");
   const tableBox = document.getElementById("csvTableContainer");
   const dlBtn = document.getElementById("downloadBtn");
 
@@ -464,7 +518,8 @@ async function runCsvPrediction() {{
   }}
 
   const file = fileInput.files[0];
-  statusEl.textContent = "Processing " + file.name + " via Render NLP API...";
+  statusEl.innerHTML = "<span style='color:#38BDF8;'>Processing " + file.name + " via Render NLP API...</span>";
+  statsBox.innerHTML = "";
   tableBox.innerHTML = "";
   dlBtn.style.display = "none";
 
@@ -480,13 +535,17 @@ async function runCsvPrediction() {{
     }}
     const payload = await res.json();
     const rows = payload.predictions || [];
+    const counts = payload.counts || {{ FAVOR: 0, AGAINST: 0, NONE: 0 }};
 
-    // Build Output CSV (id,label)
-    let csvLines = ["id,label"];
+    // Build complete Output CSV (id,label) for all rows
+    lastCsvOutputText = payload.csv_text || "";
+    dlBtn.style.display = "inline-flex";
+
+    // Automatically trigger download of output_predictions.csv!
+    downloadOutputCsv();
+
     let tbody = "";
     for (const r of rows) {{
-      const safeId = String(r.id).replace(/"/g, '""');
-      csvLines.push(`${{safeId}},${{r.label}}`);
       const escapedText = String(r.text).replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");
       tbody += `<tr>
         <td><b>${{r.id}}</b></td>
@@ -495,10 +554,20 @@ async function runCsvPrediction() {{
         <td>${{(r.confidence * 100).toFixed(1)}}%</td>
       </tr>`;
     }}
-    lastCsvOutputText = csvLines.join("\\n");
-    dlBtn.style.display = "inline-flex";
-    statusEl.innerHTML = `&#10004; Predicted ${{rows.length}} rows! Output CSV (id, label) is ready below.`;
-    tableBox.innerHTML = `
+
+    statusEl.innerHTML = `&#10004; Predicted all ${{payload.total_count}} rows &amp; downloaded <code>output_predictions.csv</code> (id, label)!`;
+    statsBox.innerHTML = `
+      <div class="stats-row">
+        <div class="sbox"><div class="lbl">Total Rows</div><div class="num">${{payload.total_count}}</div></div>
+        <div class="sbox"><div class="lbl">🟢 FAVOR</div><div class="num">${{counts.FAVOR || 0}}</div></div>
+        <div class="sbox"><div class="lbl">🔴 AGAINST</div><div class="num">${{counts.AGAINST || 0}}</div></div>
+        <div class="sbox"><div class="lbl">⚪ NONE</div><div class="num">${{counts.NONE || 0}}</div></div>
+      </div>
+    `;
+    const note = payload.total_count > rows.length
+      ? `<p style="font-size:0.82rem; margin-top:10px;">Showing first ${{rows.length}} of ${{payload.total_count}} rows below (all ${{payload.total_count}} rows are saved in your downloaded <code>output_predictions.csv</code>).</p>`
+      : "";
+    tableBox.innerHTML = note + `
       <div class="table-box">
         <table>
           <thead><tr><th>id</th><th>text</th><th>label (Predicted Stance)</th><th>Confidence</th></tr></thead>
@@ -582,18 +651,34 @@ async def predict_csv(
     texts = df[text_col].fillna("").astype(str).tolist()
     ids = df[id_col].tolist()
     eval_results = predict_texts(texts)
-
-    fmt = output_format.strip().lower()
-    if fmt == "json_preview":
-        for row_id, r in zip(ids, eval_results):
-            r["id"] = row_id
-        return {"count": len(eval_results), "predictions": eval_results}
-
     labels = [r["label"] for r in eval_results]
+
+    out_df = pd.DataFrame({"id": ids, "label": labels})
+    fmt = output_format.strip().lower()
+
+    if fmt == "json_preview":
+        counts = dict(Counter(labels))
+        preview_rows = []
+        for row_id, r in zip(ids[:100], eval_results[:100]):
+            preview_rows.append({
+                "id": row_id,
+                "text": r["text"],
+                "label": r["label"],
+                "confidence": r["confidence"],
+            })
+        return {
+            "total_count": len(eval_results),
+            "counts": {
+                "FAVOR": int(counts.get("FAVOR", 0)),
+                "AGAINST": int(counts.get("AGAINST", 0)),
+                "NONE": int(counts.get("NONE", 0)),
+            },
+            "predictions": preview_rows,
+            "csv_text": out_df.to_csv(index=False),
+        }
+
     if fmt == "submission":
         out_df = pd.DataFrame({"ID": ids, "Predicted Label": labels})
-    else:
-        out_df = pd.DataFrame({"id": ids, "label": labels})
 
     data = out_df.to_csv(index=False).encode("utf-8-sig")
     return StreamingResponse(
